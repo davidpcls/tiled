@@ -18,6 +18,7 @@ from fastapi import (
     Security,
     WebSocket,
 )
+from fastapi.routing import APIRoute
 from fastapi.responses import RedirectResponse
 from fastapi.security import (
     OAuth2PasswordBearer,
@@ -41,6 +42,10 @@ from starlette.status import (
     HTTP_409_CONFLICT,
 )
 
+from bluesky_authentication.integration import (
+    AuthProviderRegistration,
+    build_authentication_router,
+)
 from bluesky_authentication.authenticators import ProxiedOIDCAuthenticator
 from tiled.access_control.scopes import NO_SCOPES, PUBLIC_SCOPES, SINGLE_USER_SCOPES
 
@@ -1169,6 +1174,114 @@ def add_internal_routes(
             )
             tokens = await create_tokens_from_session(settings, db, session, provider)
         return tokens
+
+
+def _extract_route_endpoint(router: APIRouter, path: str, method: str) -> Callable:
+    method = method.upper()
+    for route in router.routes:
+        if isinstance(route, APIRoute) and route.path == path and method in route.methods:
+            return route.endpoint
+    msg = f"Could not find route endpoint for path={path!r}, method={method!r}."
+    raise RuntimeError(msg)
+
+
+class TiledAuthRouteAdapter:
+    def __init__(self) -> None:
+        self._external_endpoint_cache: dict[str, dict[str, Callable]] = {}
+        self._internal_endpoint_cache: dict[str, Callable] = {}
+
+    def include_base_routes(self, router: APIRouter) -> None:
+        router.include_router(authentication_router())
+
+    def build_internal_token_route(
+        self, authenticator: InternalAuthenticator, provider: str
+    ) -> Callable:
+        if provider in self._internal_endpoint_cache:
+            return self._internal_endpoint_cache[provider]
+
+        temp_router = APIRouter()
+        add_internal_routes(temp_router, provider, authenticator)
+        endpoint = _extract_route_endpoint(temp_router, f"/provider/{provider}/token", "POST")
+        self._internal_endpoint_cache[provider] = endpoint
+        return endpoint
+
+    def _external_endpoints(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> dict[str, Callable]:
+        if provider in self._external_endpoint_cache:
+            return self._external_endpoint_cache[provider]
+
+        temp_router = APIRouter()
+        add_external_routes(temp_router, provider, authenticator)
+        endpoints = {
+            "code": _extract_route_endpoint(temp_router, f"/provider/{provider}/code", "GET"),
+            "authorize_get": _extract_route_endpoint(
+                temp_router, f"/provider/{provider}/authorize", "GET"
+            ),
+            "authorize_post": _extract_route_endpoint(
+                temp_router, f"/provider/{provider}/authorize", "POST"
+            ),
+            "device_code_get": _extract_route_endpoint(
+                temp_router, f"/provider/{provider}/device_code", "GET"
+            ),
+            "device_code_post": _extract_route_endpoint(
+                temp_router, f"/provider/{provider}/device_code", "POST"
+            ),
+            "token": _extract_route_endpoint(temp_router, f"/provider/{provider}/token", "POST"),
+        }
+        self._external_endpoint_cache[provider] = endpoints
+        return endpoints
+
+    def build_external_code_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return self._external_endpoints(authenticator, provider)["code"]
+
+    def build_external_authorize_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return self._external_endpoints(authenticator, provider)["authorize_get"]
+
+    def build_device_code_authorize_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return self._external_endpoints(authenticator, provider)["authorize_post"]
+
+    def build_device_code_form_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return self._external_endpoints(authenticator, provider)["device_code_get"]
+
+    def build_device_code_submit_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return self._external_endpoints(authenticator, provider)["device_code_post"]
+
+    def build_device_code_token_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return self._external_endpoints(authenticator, provider)["token"]
+
+    def include_authenticator_routes(
+        self,
+        router: APIRouter,
+        *,
+        provider: str,
+        authenticator: InternalAuthenticator | ExternalAuthenticator,
+    ) -> None:
+        for custom_router in getattr(authenticator, "include_routers", []):
+            router.include_router(custom_router, prefix=f"/provider/{provider}")
+
+
+def build_shared_authentication_router(
+    authenticators: dict[str, InternalAuthenticator | ExternalAuthenticator],
+) -> APIRouter:
+    adapter = TiledAuthRouteAdapter()
+    providers = [
+        AuthProviderRegistration(provider=provider, authenticator=authenticator)
+        for provider, authenticator in authenticators.items()
+    ]
+    return build_authentication_router(providers, adapter)
 
 
 async def generate_apikey(db: AsyncSession, principal, apikey_params, request):
