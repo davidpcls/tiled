@@ -153,7 +153,7 @@ def create_refresh_token(session_id, secret_key, expires_delta):
     )
 
 
-async def decode_token(
+def decode_token(
     token: str,
     secret_keys: List[str],
     proxied_authenticator: Optional[ProxiedOIDCAuthenticator] = None,
@@ -167,7 +167,7 @@ async def decode_token(
     if payload is not None:
         return payload
     if proxied_authenticator is not None:
-        return await proxied_authenticator.decode_token(token)
+        return proxied_authenticator.decode_token(token)
     raise credentials_exception
 
 
@@ -216,7 +216,7 @@ async def get_decoded_access_token(
     if not access_token:
         return None
     try:
-        payload = await decode_token(
+        payload = decode_token(
             access_token, settings.secret_keys, settings.authenticator
         )
     except ExpiredSignatureError:
@@ -288,7 +288,7 @@ def get_api_key_websocket(
     return api_key
 
 
-async def get_decoded_access_token_websocket(
+def get_decoded_access_token_websocket(
     websocket: WebSocket,
     access_token: Optional[str] = Query(None),
     settings: Settings = Depends(get_settings),
@@ -297,7 +297,7 @@ async def get_decoded_access_token_websocket(
     if not access_token:
         return None
     try:
-        return await decode_token(access_token, settings.secret_keys, settings.authenticator)
+        return decode_token(access_token, settings.secret_keys, settings.authenticator)
     except ExpiredSignatureError:
         raise HTTPException(
             status_code=HTTP_401_UNAUTHORIZED,
@@ -492,7 +492,7 @@ async def authenticate_websocket_first_message(
         return True, principal, access_tags, scopes
     elif access_token is not None:
         try:
-            decoded = await decode_token(
+            decoded = decode_token(
                 access_token, settings.secret_keys, settings.authenticator
             )
         except Exception:
@@ -1547,7 +1547,7 @@ def authentication_router() -> APIRouter:
     ):
         "Mark a Session as revoked so it cannot be refreshed again."
         request.state.endpoint = "auth"
-        payload = await decode_token(refresh_token.refresh_token, settings.secret_keys)
+        payload = decode_token(refresh_token.refresh_token, settings.secret_keys)
         session_id = payload["sid"]
         async with db_factory() as db:
             # Find this session in the database.
@@ -1590,7 +1590,7 @@ def authentication_router() -> APIRouter:
 
     async def slide_session(refresh_token, settings, db):
         try:
-            payload = await decode_token(refresh_token, settings.secret_keys)
+            payload = decode_token(refresh_token, settings.secret_keys)
         except ExpiredSignatureError:
             raise HTTPException(
                 status_code=HTTP_401_UNAUTHORIZED,
