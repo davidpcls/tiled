@@ -42,6 +42,7 @@ from starlette.status import (
     HTTP_409_CONFLICT,
 )
 
+from bluesky_authentication import tokens as auth_tokens
 from bluesky_authentication.integration import (
     AuthProviderRegistration,
     build_authentication_router,
@@ -54,7 +55,7 @@ from tiled.access_control.scopes import NO_SCOPES, PUBLIC_SCOPES, SINGLE_USER_SC
 #     int_from_bytes is deprecated, use int.from_bytes instead
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    from jose import ExpiredSignatureError, JWTError, jwt
+    from jose import ExpiredSignatureError
 
 from pydantic import BaseModel
 
@@ -78,8 +79,6 @@ from .dependencies import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from .protocols import ExternalAuthenticator, InternalAuthenticator, UserSessionState
 from .settings import Settings, get_settings
 from .utils import API_KEY_COOKIE_NAME, get_base_url
-
-ALGORITHM = "HS256"
 
 # Max API keys and Sessions allowed to Principal.
 # This is here for at least two reasons:
@@ -137,25 +136,24 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="PLACEHOLDER", auto_error=False)
 
 
 def create_access_token(data, secret_key, expires_delta):
-    to_encode = data.copy()
-    expire = utcnow() + expires_delta
-    to_encode.update({"exp": expire, "type": "access"})
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
-    return encoded_jwt
+    return auth_tokens.create_access_token(
+        data,
+        secret_key,
+        expires_delta,
+        utcnow=utcnow,
+    )
 
 
 def create_refresh_token(session_id, secret_key, expires_delta):
-    expire = utcnow() + expires_delta
-    to_encode = {
-        "type": "refresh",
-        "sid": session_id,
-        "exp": expire,
-    }
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
-    return encoded_jwt
+    return auth_tokens.create_refresh_token(
+        session_id,
+        secret_key,
+        expires_delta,
+        utcnow=utcnow,
+    )
 
 
-def decode_token(
+async def decode_token(
     token: str,
     secret_keys: List[str],
     proxied_authenticator: Optional[ProxiedOIDCAuthenticator] = None,
@@ -165,21 +163,15 @@ def decode_token(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    # Try tiled-issued keys first (covers both normal auth and auth-code flow
-    # tokens issued via create_tokens_from_session).
-    for secret_key in secret_keys:
-        try:
-            payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
-            return payload
-        except ExpiredSignatureError:
-            raise
-        except JWTError:
-            continue
-    # If none of the tiled keys worked, try the proxied authenticator
-    # (e.g. tokens issued directly by an OIDC provider in the device code flow).
-    if proxied_authenticator:
-        return proxied_authenticator.decode_token(token)
-    raise credentials_exception
+    proxied_decoder = (
+        proxied_authenticator.decode_token if proxied_authenticator is not None else None
+    )
+    return await auth_tokens.decode_token(
+        token,
+        secret_keys,
+        proxied_decoder=proxied_decoder,
+        credentials_exception=credentials_exception,
+    )
 
 
 async def get_api_key(
@@ -227,7 +219,7 @@ async def get_decoded_access_token(
     if not access_token:
         return None
     try:
-        payload = decode_token(
+        payload = await decode_token(
             access_token, settings.secret_keys, settings.authenticator
         )
     except ExpiredSignatureError:
@@ -299,7 +291,7 @@ def get_api_key_websocket(
     return api_key
 
 
-def get_decoded_access_token_websocket(
+async def get_decoded_access_token_websocket(
     websocket: WebSocket,
     access_token: Optional[str] = Query(None),
     settings: Settings = Depends(get_settings),
@@ -308,7 +300,7 @@ def get_decoded_access_token_websocket(
     if not access_token:
         return None
     try:
-        return decode_token(access_token, settings.secret_keys, settings.authenticator)
+        return await decode_token(access_token, settings.secret_keys, settings.authenticator)
     except ExpiredSignatureError:
         raise HTTPException(
             status_code=HTTP_401_UNAUTHORIZED,
@@ -503,7 +495,7 @@ async def authenticate_websocket_first_message(
         return True, principal, access_tags, scopes
     elif access_token is not None:
         try:
-            decoded = decode_token(
+            decoded = await decode_token(
                 access_token, settings.secret_keys, settings.authenticator
             )
         except Exception:
@@ -1558,7 +1550,7 @@ def authentication_router() -> APIRouter:
     ):
         "Mark a Session as revoked so it cannot be refreshed again."
         request.state.endpoint = "auth"
-        payload = decode_token(refresh_token.refresh_token, settings.secret_keys)
+        payload = await decode_token(refresh_token.refresh_token, settings.secret_keys)
         session_id = payload["sid"]
         async with db_factory() as db:
             # Find this session in the database.
@@ -1601,7 +1593,7 @@ def authentication_router() -> APIRouter:
 
     async def slide_session(refresh_token, settings, db):
         try:
-            payload = decode_token(refresh_token, settings.secret_keys)
+            payload = await decode_token(refresh_token, settings.secret_keys)
         except ExpiredSignatureError:
             raise HTTPException(
                 status_code=HTTP_401_UNAUTHORIZED,
