@@ -163,15 +163,12 @@ async def decode_token(
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    proxied_decoder = (
-        proxied_authenticator.decode_token if proxied_authenticator is not None else None
-    )
-    return await auth_tokens.decode_token(
-        token,
-        secret_keys,
-        proxied_decoder=proxied_decoder,
-        credentials_exception=credentials_exception,
-    )
+    payload = auth_tokens.decode_token_with_secret_keys(token, secret_keys)
+    if payload is not None:
+        return payload
+    if proxied_authenticator is not None:
+        return await proxied_authenticator.decode_token(token)
+    raise credentials_exception
 
 
 async def get_api_key(
