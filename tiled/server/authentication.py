@@ -41,15 +41,21 @@ from starlette.status import (
     HTTP_409_CONFLICT,
 )
 
+from bluesky_authentication import tokens as auth_tokens
+from bluesky_authentication.integration import (
+    AuthProviderRegistration,
+    build_authentication_router,
+)
+from bluesky_authentication.authenticators import ProxiedOIDCAuthenticator
+from bluesky_authentication.tokens import decode_token
 from tiled.access_control.scopes import NO_SCOPES, PUBLIC_SCOPES, SINGLE_USER_SCOPES
-from tiled.authenticators import ProxiedOIDCAuthenticator
 
 # To hide third-party warning
 # .../jose/backends/cryptography_backend.py:18: CryptographyDeprecationWarning:
 #     int_from_bytes is deprecated, use int.from_bytes instead
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
-    from jose import ExpiredSignatureError, JWTError, jwt
+    from jose import ExpiredSignatureError
 
 from pydantic import BaseModel
 
@@ -73,8 +79,6 @@ from .dependencies import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from .protocols import ExternalAuthenticator, InternalAuthenticator, UserSessionState
 from .settings import Settings, get_settings
 from .utils import API_KEY_COOKIE_NAME, get_base_url
-
-ALGORITHM = "HS256"
 
 # Max API keys and Sessions allowed to Principal.
 # This is here for at least two reasons:
@@ -132,49 +136,23 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="PLACEHOLDER", auto_error=False)
 
 
 def create_access_token(data, secret_key, expires_delta):
-    to_encode = data.copy()
-    expire = utcnow() + expires_delta
-    to_encode.update({"exp": expire, "type": "access"})
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
-    return encoded_jwt
+    return auth_tokens.create_access_token(
+        data,
+        secret_key,
+        expires_delta,
+        utcnow=utcnow,
+    )
 
 
 def create_refresh_token(session_id, secret_key, expires_delta):
-    expire = utcnow() + expires_delta
-    to_encode = {
-        "type": "refresh",
-        "sid": session_id,
-        "exp": expire,
-    }
-    encoded_jwt = jwt.encode(to_encode, secret_key, algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-def decode_token(
-    token: str,
-    secret_keys: List[str],
-    proxied_authenticator: Optional[ProxiedOIDCAuthenticator] = None,
-) -> dict[str, Any]:
-    credentials_exception = HTTPException(
-        status_code=HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+    return auth_tokens.create_refresh_token(
+        session_id,
+        secret_key,
+        expires_delta,
+        utcnow=utcnow,
     )
-    # Try tiled-issued keys first (covers both normal auth and auth-code flow
-    # tokens issued via create_tokens_from_session).
-    for secret_key in secret_keys:
-        try:
-            payload = jwt.decode(token, secret_key, algorithms=[ALGORITHM])
-            return payload
-        except ExpiredSignatureError:
-            raise
-        except JWTError:
-            continue
-    # If none of the tiled keys worked, try the proxied authenticator
-    # (e.g. tokens issued directly by an OIDC provider in the device code flow).
-    if proxied_authenticator:
-        return proxied_authenticator.decode_token(token)
-    raise credentials_exception
+
+
 
 
 async def get_api_key(
@@ -223,7 +201,9 @@ async def get_decoded_access_token(
         return None
     try:
         payload = decode_token(
-            access_token, settings.secret_keys, settings.authenticator
+            access_token,
+            settings.secret_keys,
+            proxied_decoder=settings.authenticator.decode_token if settings.authenticator else None,
         )
     except ExpiredSignatureError:
         raise HTTPException(
@@ -303,7 +283,11 @@ def get_decoded_access_token_websocket(
     if not access_token:
         return None
     try:
-        return decode_token(access_token, settings.secret_keys, settings.authenticator)
+        return decode_token(
+            access_token,
+            settings.secret_keys,
+            proxied_decoder=settings.authenticator.decode_token if settings.authenticator else None,
+        )
     except ExpiredSignatureError:
         raise HTTPException(
             status_code=HTTP_401_UNAUTHORIZED,
@@ -499,7 +483,9 @@ async def authenticate_websocket_first_message(
     elif access_token is not None:
         try:
             decoded = decode_token(
-                access_token, settings.secret_keys, settings.authenticator
+                access_token,
+                settings.secret_keys,
+                proxied_decoder=settings.authenticator.decode_token if settings.authenticator else None,
             )
         except Exception:
             return False, None, None, NO_SCOPES
@@ -892,19 +878,15 @@ async def create_tokens_from_session(
     }
 
 
-def add_external_routes(
-    router: APIRouter, provider: str, authenticator: ExternalAuthenticator
-):
+def build_external_code_route(
+    provider: str, authenticator: ExternalAuthenticator
+) -> Callable:
     if not SHARE_TILED_PATH:
         raise Exception(
             "Static assets could not be found and are required for "
             "setting up external OAuth authentication."
         )
-    templates = Jinja2Templates(Path(SHARE_TILED_PATH, "templates"))
 
-    "Build an auth_code route function for this Authenticator."
-
-    @router.get(f"/provider/{provider}/code")
     async def auth_code_route(
         request: Request,
         response: Response,
@@ -951,15 +933,18 @@ def add_external_routes(
             else:
                 return tokens
 
-    @router.get(f"/provider/{provider}/authorize")
+    return auth_code_route
+
+
+def build_external_authorize_route(
+    provider: str, authenticator: ExternalAuthenticator
+) -> Callable:
     async def authorize_redirect_route(
         request: Request,
         state: Optional[str] = Query(None),
     ):
         """Redirect browser to OAuth provider for authentication."""
-
         redirect_uri = f"{get_base_url(request)}/auth/provider/{provider}/code"
-
         scopes = {"openid", "offline_access"}
         scopes.update(getattr(authenticator, "extra_scopes", []))
         params = {
@@ -971,13 +956,15 @@ def add_external_routes(
         }
         if state:
             params["state"] = state
-
         auth_url = authenticator.authorization_endpoint.copy_with(params=params)
         return RedirectResponse(url=str(auth_url))
 
-    "Build an /authorize route function for this Authenticator."
+    return authorize_redirect_route
 
-    @router.post(f"/provider/{provider}/authorize")
+
+def build_device_code_authorize_route(
+    provider: str, authenticator: ExternalAuthenticator
+) -> Callable:
     async def device_code_authorize_route(
         request: Request,
         db_factory: Callable[[], Optional[AsyncSession]] = Depends(
@@ -997,19 +984,27 @@ def add_external_routes(
             }
         )
         return {
-            "authorization_uri": str(
-                authorization_uri
-            ),  # URL that user should visit in browser
-            "verification_uri": str(
-                verification_uri
-            ),  # URL that terminal client will poll
-            "interval": DEVICE_CODE_POLLING_INTERVAL,  # suggested polling interval
+            "authorization_uri": str(authorization_uri),
+            "verification_uri": str(verification_uri),
+            "interval": DEVICE_CODE_POLLING_INTERVAL,
             "device_code": pending_session["device_code"],
-            "expires_in": DEVICE_CODE_MAX_AGE,  # seconds
+            "expires_in": DEVICE_CODE_MAX_AGE,
             "user_code": pending_session["user_code"],
         }
 
-    @router.get(f"/provider/{provider}/device_code")
+    return device_code_authorize_route
+
+
+def build_device_code_form_route(
+    provider: str, authenticator: ExternalAuthenticator
+) -> Callable:
+    if not SHARE_TILED_PATH:
+        raise Exception(
+            "Static assets could not be found and are required for "
+            "setting up external OAuth authentication."
+        )
+    templates = Jinja2Templates(Path(SHARE_TILED_PATH, "templates"))
+
     async def device_code_user_code_form_route(
         request: Request,
         code: str,
@@ -1026,9 +1021,19 @@ def add_external_routes(
             },
         )
 
-    "Build an /authorize route function for this Authenticator."
+    return device_code_user_code_form_route
 
-    @router.post(f"/provider/{provider}/device_code")
+
+def build_device_code_submit_route(
+    provider: str, authenticator: ExternalAuthenticator
+) -> Callable:
+    if not SHARE_TILED_PATH:
+        raise Exception(
+            "Static assets could not be found and are required for "
+            "setting up external OAuth authentication."
+        )
+    templates = Jinja2Templates(Path(SHARE_TILED_PATH, "templates"))
+
     async def device_code_user_code_submit_route(
         request: Request,
         code: str = Form(),
@@ -1092,9 +1097,12 @@ def add_external_routes(
             },
         )
 
-    "Build an /authorize route function for this Authenticator."
+    return device_code_user_code_submit_route
 
-    @router.post(f"/provider/{provider}/token")
+
+def build_device_code_token_route(
+    provider: str, authenticator: ExternalAuthenticator
+) -> Callable:
     async def device_code_token_route(
         request: Request,
         body: schemas.DeviceCode,
@@ -1108,7 +1116,6 @@ def add_external_routes(
         try:
             device_code = bytes.fromhex(device_code_hex)
         except Exception:
-            # Not valid hex, therefore not a valid device_code
             raise HTTPException(
                 status_code=HTTP_401_UNAUTHORIZED, detail="Invalid device code"
             )
@@ -1126,19 +1133,17 @@ def add_external_routes(
                     HTTP_400_BAD_REQUEST, {"error": "authorization_pending"}
                 )
             session = pending_session.session
-            # The pending session can only be used once.
             await db.delete(pending_session)
             await db.commit()
             tokens = await create_tokens_from_session(settings, db, session, provider)
         return tokens
 
+    return device_code_token_route
 
-def add_internal_routes(
-    router: APIRouter, provider: str, authenticator: InternalAuthenticator
-):
-    "Register a handle_credentials route function for this Authenticator."
 
-    @router.post(f"/provider/{provider}/token")
+def build_internal_token_route(
+    provider: str, authenticator: InternalAuthenticator
+) -> Callable:
     async def handle_credentials_route(
         request: Request,
         form_data: OAuth2PasswordRequestForm = Depends(),
@@ -1169,6 +1174,120 @@ def add_internal_routes(
             )
             tokens = await create_tokens_from_session(settings, db, session, provider)
         return tokens
+
+    return handle_credentials_route
+
+
+# ---------------------------------------------------------------------------
+# Keep add_*_routes as thin wrappers for backward compatibility
+# (tiled's own test suite may import them directly).
+# ---------------------------------------------------------------------------
+
+
+def add_external_routes(
+    router: APIRouter, provider: str, authenticator: ExternalAuthenticator
+):
+    router.add_api_route(
+        f"/provider/{provider}/code",
+        build_external_code_route(provider, authenticator),
+        methods=["GET"],
+    )
+    router.add_api_route(
+        f"/provider/{provider}/authorize",
+        build_external_authorize_route(provider, authenticator),
+        methods=["GET"],
+    )
+    router.add_api_route(
+        f"/provider/{provider}/authorize",
+        build_device_code_authorize_route(provider, authenticator),
+        methods=["POST"],
+    )
+    router.add_api_route(
+        f"/provider/{provider}/device_code",
+        build_device_code_form_route(provider, authenticator),
+        methods=["GET"],
+    )
+    router.add_api_route(
+        f"/provider/{provider}/device_code",
+        build_device_code_submit_route(provider, authenticator),
+        methods=["POST"],
+    )
+    router.add_api_route(
+        f"/provider/{provider}/token",
+        build_device_code_token_route(provider, authenticator),
+        methods=["POST"],
+    )
+
+
+def add_internal_routes(
+    router: APIRouter, provider: str, authenticator: InternalAuthenticator
+):
+    router.add_api_route(
+        f"/provider/{provider}/token",
+        build_internal_token_route(provider, authenticator),
+        methods=["POST"],
+    )
+
+
+class TiledAuthRouteAdapter:
+    def include_base_routes(self, router: APIRouter) -> None:
+        router.include_router(authentication_router())
+
+    def build_internal_token_route(
+        self, authenticator: InternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_internal_token_route(provider, authenticator)
+
+    def build_external_code_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_external_code_route(provider, authenticator)
+
+    def build_external_authorize_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_external_authorize_route(provider, authenticator)
+
+    def build_device_code_authorize_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_device_code_authorize_route(provider, authenticator)
+
+    def build_device_code_form_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_device_code_form_route(provider, authenticator)
+
+    def build_device_code_submit_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_device_code_submit_route(provider, authenticator)
+
+    def build_device_code_token_route(
+        self, authenticator: ExternalAuthenticator, provider: str
+    ) -> Callable:
+        return build_device_code_token_route(provider, authenticator)
+
+    def include_authenticator_routes(
+        self,
+        router: APIRouter,
+        *,
+        provider: str,
+        authenticator: InternalAuthenticator | ExternalAuthenticator,
+    ) -> None:
+        for custom_router in getattr(authenticator, "include_routers", []):
+            router.include_router(custom_router, prefix=f"/provider/{provider}")
+
+
+def build_shared_authentication_router(
+    authenticators: dict[str, InternalAuthenticator | ExternalAuthenticator],
+) -> APIRouter:
+    adapter = TiledAuthRouteAdapter()
+    providers = [
+        AuthProviderRegistration(provider=provider, authenticator=authenticator)
+        for provider, authenticator in authenticators.items()
+    ]
+    return build_authentication_router(providers, adapter)
 
 
 async def generate_apikey(db: AsyncSession, principal, apikey_params, request):

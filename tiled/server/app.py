@@ -37,7 +37,7 @@ from starlette.status import (
 )
 
 from ..access_control.protocols import AccessPolicy
-from ..authenticators import ProxiedOIDCAuthenticator
+from bluesky_authentication.authenticators import ProxiedOIDCAuthenticator
 from ..catalog.adapter import WouldDeleteData
 from ..config import (
     Authentication,
@@ -60,7 +60,7 @@ from ..utils import SHARE_TILED_PATH, Conflicts, UnsupportedQueryType
 from ..validation_registration import ValidationRegistry, default_validation_registry
 from .authentication import move_api_key
 from .compression import CompressionMiddleware
-from .protocols import ExternalAuthenticator, InternalAuthenticator
+from .protocols import ExternalAuthenticator
 from .router import get_metrics_router, get_router
 from .settings import Settings, get_settings
 from .utils import API_KEY_COOKIE_NAME, CSRF_COOKIE_NAME, get_root_url, record_timing
@@ -433,9 +433,7 @@ def build_app(
         # Delay this imports to avoid delaying startup with the SQL and cryptography
         # imports if they are not needed.
         from .authentication import (
-            add_external_routes,
-            add_internal_routes,
-            authentication_router,
+            build_shared_authentication_router,
             oauth2_scheme,
         )
 
@@ -444,25 +442,10 @@ def build_app(
         oauth2_scheme.model.flows.password.tokenUrl = (
             f"/api/v1/auth/provider/{first_provider}/token"
         )
-        # Authenticators provide Router(s) for their particular flow.
-        # Collect them in the authentication_router.
-        authentication_router = authentication_router()
-        # This adds the universal routes like /session/refresh and /session/revoke.
-        # Below we will add routes specific to our authentication providers.
-
+        authentication_router = build_shared_authentication_router(authenticators)
         for provider, authenticator in authenticators.items():
-            if isinstance(authenticator, InternalAuthenticator):
-                add_internal_routes(authentication_router, provider, authenticator)
-            elif isinstance(authenticator, ExternalAuthenticator):
-                add_external_routes(authentication_router, provider, authenticator)
-                if isinstance(authenticator, ProxiedOIDCAuthenticator):
-                    app.state.provider = provider
-            else:
-                raise ValueError(f"unknown authenticator type {type(authenticator)}")
-            for custom_router in getattr(authenticator, "include_routers", []):
-                authentication_router.include_router(
-                    custom_router, prefix=f"/provider/{provider}"
-                )
+            if isinstance(authenticator, ProxiedOIDCAuthenticator):
+                app.state.provider = provider
         # And add this authentication_router itself to the app.
         app.include_router(authentication_router, prefix="/api/v1/auth")
         app.state.authenticated = True
